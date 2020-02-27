@@ -32,6 +32,7 @@
 #include <optional>
 #include <vector>
 #include <string>
+#include <sys/wait.h>
 
 namespace iorap::maintenance {
 
@@ -39,7 +40,7 @@ namespace iorap::maintenance {
 db::CompiledTraceFileModel CalculateNewestFilePath(
     const std::string& package_name,
     const std::string& activity_name,
-    const std::optional<int> version) {
+    int version) {
    db::VersionedComponentName versioned_component_name{
      package_name, activity_name, version};
 
@@ -116,6 +117,15 @@ bool StartViaFork(const CompilerForkParameters& params) {
     LOG(FATAL) << "Failed to fork a process for compilation";
   } else if (child > 0) {  // we are the caller of this function
     LOG(DEBUG) << "forked into a process for compilation , pid = " << child;
+
+    int wstatus;
+    waitpid(child, /*out*/&wstatus, /*options*/0);
+    if (!WIFEXITED(wstatus)) {
+      LOG(ERROR) << "Child terminated abnormally, status: " << WEXITSTATUS(wstatus);
+      return false;
+    }
+    LOG(DEBUG) << "Child terminated, status: " << WEXITSTATUS(wstatus);
+
     return true;
   } else {
     // we are the child that was forked.
@@ -195,9 +205,10 @@ bool CompileActivity(const db::DbHandle& db,
                      int package_id,
                      const std::string& package_name,
                      const std::string& activity_name,
+                     int version,
                      const ControllerParameters& params) {
   db::CompiledTraceFileModel output_file =
-      CalculateNewestFilePath(package_name, activity_name, /* version= */std::nullopt);
+      CalculateNewestFilePath(package_name, activity_name, version);
 
   std::string file_path = output_file.FilePath();
 
@@ -233,6 +244,7 @@ bool CompileActivity(const db::DbHandle& db,
     LOG(DEBUG) << "Try to compiled package_id: " << package_id
                << " package_name: " << package_name
                << " activity_name: " << activity_name
+               << " version: " << version
                << " file_path: " << file_path
                << " verbose: " << params.verbose
                << " perfetto_traces: "
@@ -253,6 +265,7 @@ bool CompileActivity(const db::DbHandle& db,
                  <<" activity_name: " <<activity_name;
       return false;
     }
+
   }
 
   std::optional<db::PrefetchFileModel> compiled_trace =
@@ -268,12 +281,16 @@ bool CompileActivity(const db::DbHandle& db,
 // Compiled the perfetto traces for activities in an package.
 bool CompilePackage(const db::DbHandle& db,
                     const std::string& package_name,
+                    int version,
                     const ControllerParameters& params) {
   std::optional<db::PackageModel> package =
-      db::PackageModel::SelectByName(db, package_name.c_str());
+        db::PackageModel::SelectByNameAndVersion(db, package_name.c_str(), version);
 
   if (!package) {
-    LOG(ERROR) << "Cannot find package for package_name: " << package_name;
+    LOG(ERROR) << "Cannot find package for package_name: "
+               << package_name
+               << " and version "
+               << version;
     return false;
   }
 
@@ -282,7 +299,7 @@ bool CompilePackage(const db::DbHandle& db,
 
   bool ret = true;
   for (db::ActivityModel activity : activities) {
-    if (!CompileActivity(db, package->id, package->name, activity.name, params)) {
+    if (!CompileActivity(db, package->id, package->name, activity.name, version, params)) {
       ret = false;
     }
   }
@@ -294,7 +311,7 @@ bool CompileAppsOnDevice(const db::DbHandle& db, const ControllerParameters& par
   std::vector<db::PackageModel> packages = db::PackageModel::SelectAll(db);
   bool ret = true;
   for (db::PackageModel package : packages) {
-    if (!CompilePackage(db, package.name, params)) {
+    if (!CompilePackage(db, package.name, package.version, params)) {
       ret = false;
     }
   }
@@ -310,26 +327,32 @@ bool Compile(const std::string& db_path, const ControllerParameters& params) {
 
 bool Compile(const std::string& db_path,
              const std::string& package_name,
+             int version,
              const ControllerParameters& params) {
   iorap::db::SchemaModel db_schema = db::SchemaModel::GetOrCreate(db_path);
   db::DbHandle db{db_schema.db()};
-  return CompilePackage(db, package_name, params);
+  return CompilePackage(db, package_name, version, params);
 }
 
 bool Compile(const std::string& db_path,
              const std::string& package_name,
              const std::string& activity_name,
+             int version,
              const ControllerParameters& params) {
   iorap::db::SchemaModel db_schema = db::SchemaModel::GetOrCreate(db_path);
   db::DbHandle db{db_schema.db()};
 
   std::optional<db::PackageModel> package =
-      db::PackageModel::SelectByName(db, package_name.c_str());
+      db::PackageModel::SelectByNameAndVersion(db, package_name.c_str(), version);
+
   if (!package) {
-    LOG(ERROR) << "Cannot find package with name " << package_name;
+    LOG(ERROR) << "Cannot find package with name "
+               << package_name
+               << " and version "
+               << version;
     return false;
   }
-  return CompileActivity(db, package->id, package_name, activity_name, params);
+  return CompileActivity(db, package->id, package_name, activity_name, version, params);
 }
 
 }  // namespace iorap::maintenance

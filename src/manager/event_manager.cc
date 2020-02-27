@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "binder/package_version_map.h"
 #include "common/debug.h"
 #include "common/expected.h"
 #include "common/rx_async.h"
@@ -21,12 +22,14 @@
 #include "db/file_models.h"
 #include "db/models.h"
 #include "maintenance/controller.h"
+#include "maintenance/db_cleaner.h"
 #include "manager/event_manager.h"
 #include "perfetto/rx_producer.h"
 #include "prefetcher/read_ahead.h"
 #include "prefetcher/task_id.h"
 
 #include <android-base/chrono_utils.h>
+#include <android-base/strings.h>
 #include <android-base/properties.h>
 #include <rxcpp/rx.hpp>
 #include <server_configurable_flags/get_flags.h>
@@ -34,6 +37,8 @@
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <type_traits>
+#include <unordered_map>
 #include <utils/Trace.h>
 
 using rxcpp::observe_on_one_worker;
@@ -52,6 +57,43 @@ using perfetto::PerfettoStreamCommand;
 using perfetto::PerfettoTraceProto;
 
 using db::AppComponentName;
+
+struct PackageBlacklister {
+  // "x.y.z;foo.bar.baz" colon-separated list of substrings
+  PackageBlacklister(std::string blacklist_string) {
+    LOG(VERBOSE) << "Configuring package blacklister with string: " << blacklist_string;
+
+    std::vector<std::string> split = ::android::base::Split(blacklist_string, ";");
+
+    // Ignore any l/r whitespace or empty strings.
+    for (const std::string& s : split) {
+      std::string t = ::android::base::Trim(s);
+      if (!t.empty()) {
+        LOG(INFO) << "Blacklisted package: " << t << "; will not optimize.";
+        packages_.push_back(t);
+      }
+    }
+  }
+
+  PackageBlacklister() = default;
+
+  bool IsBlacklisted(const std::string& package_name) const {
+    return std::find(packages_.begin(), packages_.end(), package_name) != packages_.end();
+  }
+
+  bool IsBlacklisted(const AppComponentName& component_name) const {
+    return IsBlacklisted(component_name.package);
+  }
+
+  bool IsBlacklisted(const std::optional<AppComponentName>& component_name) const {
+    return component_name.has_value() && IsBlacklisted(component_name->package);
+  }
+
+ private:
+  std::vector<std::string> packages_;
+};
+
+using PackageVersionMap = std::unordered_map<std::string, int64_t>;
 
 // Main logic of the #OnAppLaunchEvent scan method.
 //
@@ -92,17 +134,23 @@ struct AppLaunchEventState {
   std::optional<rxcpp::composite_subscription> rx_lifetime_;
   std::vector<rxcpp::composite_subscription> rx_in_flight_;
 
+  PackageBlacklister package_blacklister_{};
+
   borrowed<perfetto::RxProducerFactory*> perfetto_factory_;  // not null
   borrowed<observe_on_one_worker*> thread_;  // not null
   borrowed<observe_on_one_worker*> io_thread_;  // not null
   borrowed<AsyncPool*> async_pool_;  // not null
 
+  std::shared_ptr<binder::PackageVersionMap> version_map_;
+
   explicit AppLaunchEventState(borrowed<perfetto::RxProducerFactory*> perfetto_factory,
                                bool allowed_readahead,
                                bool allowed_tracing,
+                               PackageBlacklister package_blacklister,
                                borrowed<observe_on_one_worker*> thread,
                                borrowed<observe_on_one_worker*> io_thread,
-                               borrowed<AsyncPool*> async_pool)
+                               borrowed<AsyncPool*> async_pool,
+                               std::shared_ptr<binder::PackageVersionMap> version_map)
     : read_ahead_{std::make_shared<prefetcher::ReadAhead>()}
   {
     perfetto_factory_ = perfetto_factory;
@@ -110,6 +158,8 @@ struct AppLaunchEventState {
 
     allowed_readahead_ = allowed_readahead;
     allowed_tracing_ = allowed_tracing;
+
+    package_blacklister_ = package_blacklister;
 
     thread_ = thread;
     DCHECK(thread_ != nullptr);
@@ -119,6 +169,9 @@ struct AppLaunchEventState {
 
     async_pool_ = async_pool;
     DCHECK(async_pool_ != nullptr);
+
+    version_map_ = version_map;
+    DCHECK(version_map_ != nullptr);
   }
 
   // Updates the values in this struct only as a side effect.
@@ -138,6 +191,18 @@ struct AppLaunchEventState {
 
     switch (event.type) {
       case Type::kIntentStarted: {
+        const std::string& package_name = event.intent_proto->component().package_name();
+        const std::string& class_name = event.intent_proto->component().class_name();
+        AppComponentName component_name{package_name, class_name};
+        component_name = component_name.Canonicalize();
+        component_name_ = component_name;
+
+        if (package_blacklister_.IsBlacklisted(component_name)) {
+          LOG(DEBUG) << "kIntentStarted: package " << component_name.package
+                     << " ignored due to blacklisting.";
+          break;
+        }
+
         // Create a new history ID chain for each new app start-up sequence.
         auto history_id_observable = rxcpp::observable<>::create<int>(
           [&](rxcpp::subscriber<int> subscriber) {
@@ -160,11 +225,6 @@ struct AppLaunchEventState {
           break;
         }
 
-        const std::string& package_name = event.intent_proto->component().package_name();
-        const std::string& class_name = event.intent_proto->component().class_name();
-        AppComponentName component_name{package_name, class_name};
-        component_name_ = component_name.Canonicalize();
-
         if (allowed_readahead_) {
           StartReadAhead(sequence_id_, component_name);
         }
@@ -181,6 +241,12 @@ struct AppLaunchEventState {
         break;
       }
       case Type::kIntentFailed:
+        if (package_blacklister_.IsBlacklisted(component_name_)) {
+          LOG(VERBOSE) << "kIntentFailed: package " << component_name_->package
+                       << " ignored due to blacklisting.";
+          break;
+        }
+
         AbortTrace();
         AbortReadAhead();
 
@@ -192,6 +258,24 @@ struct AppLaunchEventState {
 
         break;
       case Type::kActivityLaunched: {
+        const std::string& title = event.activity_record_proto->identifier().title();
+        if (!AppComponentName::HasAppComponentName(title)) {
+          // Proto comment claim this is sometimes a window title.
+          // We need the actual 'package/component' here, so just ignore it if it's a title.
+          LOG(WARNING) << "App launched without a component name: " << event;
+          break;
+        }
+
+        AppComponentName component_name = AppComponentName::FromString(title);
+        component_name = component_name.Canonicalize();
+        component_name_ = component_name;
+
+        if (package_blacklister_.IsBlacklisted(component_name_)) {
+          LOG(VERBOSE) << "kActivityLaunched: package " << component_name_->package
+                       << " ignored due to blacklisting.";
+          break;
+        }
+
         // Cancel tracing for warm/hot.
         // Restart tracing if the activity was unexpected.
 
@@ -205,17 +289,6 @@ struct AppLaunchEventState {
         } else if (!IsTracing() || !IsReadAhead()) {  // and the temperature is Cold.
           // Start late trace when intent didn't have a component name
           LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent need to start new trace";
-
-          const std::string& title = event.activity_record_proto->identifier().title();
-          if (!AppComponentName::HasAppComponentName(title)) {
-            // Proto comment claim this is sometimes a window title.
-            // We need the actual 'package/component' here, so just ignore it if it's a title.
-            LOG(WARNING) << "App launched without a component name: " << event;
-            break;
-          }
-
-          AppComponentName component_name = AppComponentName::FromString(title);
-          component_name_ = component_name.Canonicalize();
 
           if (allowed_readahead_ && !IsReadAhead()) {
             StartReadAhead(sequence_id_, component_name);
@@ -235,6 +308,12 @@ struct AppLaunchEventState {
         break;
       }
       case Type::kActivityLaunchFinished:
+        if (package_blacklister_.IsBlacklisted(component_name_)) {
+          LOG(VERBOSE) << "kActivityLaunchFinished: package " << component_name_->package
+                       << " ignored due to blacklisting.";
+          break;
+        }
+
         if (event.timestamp_nanos >= 0) {
            total_time_ns_ = event.timestamp_nanos;
         }
@@ -249,11 +328,23 @@ struct AppLaunchEventState {
         FinishReadAhead();
         break;
       case Type::kActivityLaunchCancelled:
+        if (package_blacklister_.IsBlacklisted(component_name_)) {
+          LOG(VERBOSE) << "kActivityLaunchCancelled: package " << component_name_->package
+                       << " ignored due to blacklisting.";
+          break;
+        }
+
         // Abort tracing.
         AbortTrace();
         AbortReadAhead();
         break;
       case Type::kReportFullyDrawn: {
+        if (package_blacklister_.IsBlacklisted(component_name_)) {
+          LOG(VERBOSE) << "kReportFullyDrawn: package " << component_name_->package
+                       << " ignored due to blacklisting.";
+          break;
+        }
+
         if (!recent_history_id_) {
           LOG(WARNING) << "Dangling kReportFullyDrawn event";
           return;
@@ -280,10 +371,12 @@ struct AppLaunchEventState {
     // Firstly, try to find the compiled trace from sqlite.
     android::base::Timer timer{};
     db::DbHandle db{db::SchemaModel::GetSingleton()};
+    int version = version_map_->GetOrQueryPackageVersion(component_name.package);
+    db::VersionedComponentName vcn{component_name.package,
+                                   component_name.activity_name,
+                                   version};
     std::optional<db::PrefetchFileModel> compiled_trace =
-        db::PrefetchFileModel::SelectByPackageNameActivityName(db,
-                                                               component_name.package,
-                                                               component_name.activity_name);
+          db::PrefetchFileModel::SelectByVersionedComponentName(db, vcn);
 
     std::chrono::milliseconds duration_ms = timer.duration();
     LOG(DEBUG) << "EventManager: Looking up compiled trace done in "
@@ -313,7 +406,7 @@ struct AppLaunchEventState {
       return file_path;
     }
 
-    LOG(ERROR) << "Prebuilt compiled trace doesn't exists. file_path: "
+    LOG(DEBUG) << "Prebuilt compiled trace doesn't exists. file_path: "
                << file_path;
 
     return std::nullopt;
@@ -392,9 +485,10 @@ struct AppLaunchEventState {
              LOG(VERBOSE) << "StartTracing -- PerfettoTraceProto received (2)";
            });
 
+    int version = version_map_->GetOrQueryPackageVersion(component_name_->package);
     db::VersionedComponentName versioned_component_name{component_name.package,
                                                         component_name.activity_name,
-                                                        /*version*/std::nullopt};  // TODO: version
+                                                        version};
     lifetime = RxAsync::SubscribeAsync(*async_pool_,
         std::move(stream_via_threads),
         /*on_next*/[versioned_component_name]
@@ -453,9 +547,9 @@ struct AppLaunchEventState {
     if (rx_lifetime_) {
       // TODO: it would be good to call perfetto Destroy.
 
-      std::remove(rx_in_flight_.begin(),
-                  rx_in_flight_.end(),
-                  *rx_lifetime_);
+      rx_in_flight_.erase(std::remove(rx_in_flight_.begin(),
+                                      rx_in_flight_.end(), *rx_lifetime_),
+                          rx_in_flight_.end());
 
       LOG(VERBOSE) << "AppLaunchEventState - AbortTrace - Unsubscribe";
       rx_lifetime_->unsubscribe();
@@ -525,10 +619,11 @@ struct AppLaunchEventState {
 
     using namespace iorap::db;
 
+    int version = version_map_->GetOrQueryPackageVersion(component_name_->package);
     std::optional<ActivityModel> activity =
         ActivityModel::SelectOrInsert(db,
                                       component_name_->package,
-                                      /*version*/std::nullopt,
+                                      version,
                                       component_name_->activity_name);
 
     if (!activity) {
@@ -575,6 +670,85 @@ struct AppLaunchEventState {
 
     if (!result) {
       LOG(WARNING) << "Failed to update app_launch_histories row";
+    }
+  }
+};
+
+struct AppLaunchEventDefender {
+  binder::AppLaunchEvent::Type last_event_type_{binder::AppLaunchEvent::Type::kUninitialized};
+
+  enum class Result {
+    kAccept,      // Pass-through the new event.
+    kOverwrite,   // Overwrite the new event with a different event.
+    kReject       // Completely reject the new event, it will not be delivered.
+  };
+
+  Result OnAppLaunchEvent(binder::RequestId request_id,
+                          const binder::AppLaunchEvent& event,
+                          binder::AppLaunchEvent* overwrite) {
+    using Type = binder::AppLaunchEvent::Type;
+    CHECK(overwrite != nullptr);
+
+    // Ensure only legal transitions are allowed.
+    switch (last_event_type_) {
+      case Type::kUninitialized:
+      case Type::kIntentFailed:
+      case Type::kActivityLaunchCancelled:
+      case Type::kReportFullyDrawn: {  // From a terminal state, only go to kIntentStarted
+        if (event.type != Type::kIntentStarted) {
+          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = Type::kUninitialized;
+          return Result::kReject;
+        } else {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        }
+      }
+      case Type::kIntentStarted: {
+        if (event.type == Type::kIntentFailed ||
+            event.type == Type::kActivityLaunched) {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        } else {
+          LOG(WARNING) << "Overwriting transition from kIntentStarted to "
+                       << event.type << " into kIntentFailed";
+          last_event_type_ = Type::kIntentFailed;
+
+          *overwrite = event;
+          overwrite->type = Type::kIntentFailed;
+          return Result::kOverwrite;
+        }
+      }
+      case Type::kActivityLaunched: {
+        if (event.type == Type::kActivityLaunchFinished ||
+            event.type == Type::kActivityLaunchCancelled) {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        } else {
+          LOG(WARNING) << "Overwriting transition from kActivityLaunched to "
+                       << event.type << " into kActivityLaunchCancelled";
+          last_event_type_ = Type::kActivityLaunchCancelled;
+
+          *overwrite = event;
+          overwrite->type = Type::kActivityLaunchCancelled;
+          return Result::kOverwrite;
+        }
+      }
+      case Type::kActivityLaunchFinished: {
+        if (event.type == Type::kIntentStarted ||
+            event.type == Type::kReportFullyDrawn) {
+          LOG(VERBOSE) << "Accept transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = event.type;
+          return Result::kAccept;
+        } else {
+          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          last_event_type_ = Type::kUninitialized;
+          return Result::kReject;
+        }
+      }
     }
   }
 };
@@ -715,6 +889,9 @@ class EventManager::Impl {
       worker_thread_(rxcpp::observe_on_new_thread()),
       worker_thread2_(rxcpp::observe_on_new_thread()),
       io_thread_(perfetto::ObserveOnNewIoThread()) {
+    // Try to create version map
+    RetryCreateVersionMap(/*timeout*/std::chrono::seconds(60),
+                          /*interval*/std::chrono::seconds(1));
 
     // TODO: read all properties from one config class.
     // PH properties do not work if they contain ".". "_" was instead used here.
@@ -722,14 +899,52 @@ class EventManager::Impl {
     tracing_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
         ph_namespace,
         "iorap_perfetto_enable",
-        ::android::base::GetProperty("iorapd.perfetto.enable", /*default*/"false")) == "true";
+        ::android::base::GetProperty("iorapd.perfetto.enable", /*default*/"true")) == "true";
     readahead_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
         ph_namespace,
         "iorap_readahead_enable",
-        ::android::base::GetProperty("iorapd.readahead.enable", /*default*/"false")) == "true";
+        ::android::base::GetProperty("iorapd.readahead.enable", /*default*/"true")) == "true";
+
+    package_blacklister_ = PackageBlacklister{
+        /* Colon-separated string list of blacklisted packages, e.g.
+         * "foo.bar.baz;com.fake.name" would blacklist {"foo.bar.baz", "com.fake.name"} packages.
+         *
+         * Blacklisted packages are ignored by iorapd.
+         */
+        server_configurable_flags::GetServerConfigurableFlag(
+            ph_namespace,
+            "iorap_blacklisted_packages",
+            ::android::base::GetProperty("iorapd.blacklist_packages",
+                                         /*default*/""))
+    };
 
     rx_lifetime_ = InitializeRxGraph();
     rx_lifetime_jobs_ = InitializeRxGraphForJobScheduledEvents();
+  }
+
+  void RetryCreateVersionMap(std::chrono::seconds timeout,
+                             std::chrono::seconds interval) {
+    android::base::Timer timer{};
+    int64_t count = 0;
+    version_map_ = binder::PackageVersionMap::Create();
+    while (version_map_ == nullptr) {
+      std::this_thread::sleep_for(interval);
+      LOG(WARNING) << "Retry to create version map: " << ++count;
+      version_map_ = binder::PackageVersionMap::Create();
+      if (count * interval >= timeout) {
+        LOG(FATAL) << "Fail to create version map in "
+                   << timeout.count()
+                   << " seconds.";
+        abort();
+        break;
+      }
+    }
+    std::chrono::milliseconds duration_ms = timer.duration();
+    LOG(DEBUG) << "Got versions for "
+               << version_map_->Size()
+               << " packages in "
+               << duration_ms.count()
+               << "ms";
   }
 
   void SetTaskResultCallbacks(std::shared_ptr<TaskResultCallbacks> callbacks) {
@@ -747,9 +962,28 @@ class EventManager::Impl {
                  << "request_id=" << request_id.request_id << ","
                  << event;
 
-    app_launch_event_subject_.OnNext(event);
+    // Filter any incoming events through a defender that enforces
+    // that all state transitions are as contractually documented in
+    // ActivityMetricsLaunchObserver's javadoc.
+    AppLaunchEvent overwrite_event{};
+    AppLaunchEventDefender::Result result =
+        app_launch_event_defender_.OnAppLaunchEvent(request_id, event, /*out*/&overwrite_event);
 
-    return true;
+    switch (result) {
+      case AppLaunchEventDefender::Result::kAccept:
+        app_launch_event_subject_.OnNext(event);
+        return true;
+      case AppLaunchEventDefender::Result::kOverwrite:
+        app_launch_event_subject_.OnNext(overwrite_event);
+        return false;
+      case AppLaunchEventDefender::Result::kReject:
+        // Intentionally left-empty: we drop the event completely.
+        return false;
+    }
+
+    // In theory returns BAD_VALUE to the other side of this binder connection.
+    // In practice we use 'oneway' flags so this doesn't matter on a regular build.
+    return false;
   }
 
   bool OnJobScheduledEvent(RequestId request_id,
@@ -760,6 +994,10 @@ class EventManager::Impl {
     job_scheduled_event_subject_.OnNext(std::move(request_id), event);
 
     return true;  // No errors.
+  }
+
+  void Dump(/*borrow*/::android::Printer& printer) {
+    ::iorap::perfetto::PerfettoConsumerImpl::Dump(/*borrow*/printer);
   }
 
   rxcpp::composite_subscription InitializeRxGraph() {
@@ -782,9 +1020,11 @@ class EventManager::Impl {
     AppLaunchEventState initial_state{&perfetto_factory_,
                                       readahead_allowed_,
                                       tracing_allowed_,
+                                      package_blacklister_,
                                       &worker_thread2_,
                                       &io_thread_,
-                                      &async_pool_};
+                                      &async_pool_,
+                                      version_map_};
     app_launch_events_
       .subscribe_on(worker_thread_)
       .scan(std::move(initial_state),
@@ -807,7 +1047,12 @@ class EventManager::Impl {
                         bool verbose,
                         bool recompile,
                         uint64_t min_traces) {
+    // Update the version map.
+    version_map_->Update();
+    // Cleanup the obsolete data in the database.
     db::DbHandle db{db::SchemaModel::GetSingleton()};
+    maintenance::CleanUpDatabase(db, version_map_);
+    // Compilation
     maintenance::ControllerParameters params{
       output_text,
       inode_textcache,
@@ -911,11 +1156,14 @@ class EventManager::Impl {
   perfetto::RxProducerFactory& perfetto_factory_;
   bool tracing_allowed_{true};
 
+  PackageBlacklister package_blacklister_{};
+
   std::weak_ptr<TaskResultCallbacks> callbacks_;  // avoid cycles with weakptr.
 
   using AppLaunchEventRefWrapper = AppLaunchEventSubject::RefWrapper;
   rxcpp::observable<AppLaunchEventRefWrapper> app_launch_events_;
   AppLaunchEventSubject app_launch_event_subject_;
+  AppLaunchEventDefender app_launch_event_defender_;
 
   rxcpp::observable<std::pair<RequestId, JobScheduledEvent>> job_scheduled_events_;
   JobScheduledEventSubject job_scheduled_event_subject_;
@@ -932,6 +1180,9 @@ class EventManager::Impl {
 
   rxcpp::composite_subscription rx_lifetime_;  // app launch events
   rxcpp::composite_subscription rx_lifetime_jobs_;  // job scheduled events
+
+  // package version map
+  std::shared_ptr<binder::PackageVersionMap> version_map_;
 
 //INTENTIONAL_COMPILER_ERROR_HERE:
   // FIXME:
@@ -978,6 +1229,10 @@ bool EventManager::OnAppLaunchEvent(RequestId request_id,
 bool EventManager::OnJobScheduledEvent(RequestId request_id,
                                        const JobScheduledEvent& event) {
   return impl_->OnJobScheduledEvent(request_id, event);
+}
+
+void EventManager::Dump(/*borrow*/::android::Printer& printer) {
+  return impl_->Dump(printer);
 }
 
 }  // namespace iorap::manager
