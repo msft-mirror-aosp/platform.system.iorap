@@ -274,7 +274,9 @@ struct AppLaunchEventState {
 
         break;
       case Type::kActivityLaunched: {
-        const std::string& title = event.activity_record_proto->identifier().title();
+        // TODO add test in Android framework to verify this.
+        const std::string& title =
+            event.activity_record_proto->window_token().window_container().identifier().title();
         if (!AppComponentName::HasAppComponentName(title)) {
           // Proto comment claim this is sometimes a window title.
           // We need the actual 'package/component' here, so just ignore it if it's a title.
