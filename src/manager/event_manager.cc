@@ -743,7 +743,7 @@ struct AppLaunchEventDefender {
       case Type::kActivityLaunchCancelled:
       case Type::kReportFullyDrawn: {  // From a terminal state, only go to kIntentStarted
         if (event.type != Type::kIntentStarted) {
-          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          LOG(DEBUG) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
           last_event_type_ = Type::kUninitialized;
           return Result::kReject;
         } else {
@@ -759,7 +759,7 @@ struct AppLaunchEventDefender {
           last_event_type_ = event.type;
           return Result::kAccept;
         } else {
-          LOG(WARNING) << "Overwriting transition from kIntentStarted to "
+          LOG(DEBUG) << "Overwriting transition from kIntentStarted to "
                        << event.type << " into kIntentFailed";
           last_event_type_ = Type::kIntentFailed;
 
@@ -775,7 +775,7 @@ struct AppLaunchEventDefender {
           last_event_type_ = event.type;
           return Result::kAccept;
         } else {
-          LOG(WARNING) << "Overwriting transition from kActivityLaunched to "
+          LOG(DEBUG) << "Overwriting transition from kActivityLaunched to "
                        << event.type << " into kActivityLaunchCancelled";
           last_event_type_ = Type::kActivityLaunchCancelled;
 
@@ -791,7 +791,7 @@ struct AppLaunchEventDefender {
           last_event_type_ = event.type;
           return Result::kAccept;
         } else {
-          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          LOG(DEBUG) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
           last_event_type_ = Type::kUninitialized;
           return Result::kReject;
         }
