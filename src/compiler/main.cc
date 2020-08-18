@@ -29,6 +29,37 @@
 
 namespace iorap::compiler {
 
+// Log everything to stderr.
+// Log errors and higher to logd.
+class StderrAndLogdErrorLogger {
+ public:
+  explicit StderrAndLogdErrorLogger(android::base::LogId default_log_id = android::base::MAIN)
+#ifdef __ANDROID__
+      : logd_(default_log_id)
+#endif
+  {
+  }
+
+  void operator()(::android::base::LogId id,
+                  ::android::base::LogSeverity sev,
+                  const char* tag,
+                  const char* file,
+                  unsigned int line,
+                  const char* message) {
+#ifdef __ANDROID__
+    if (static_cast<int>(sev) >= static_cast<int>(::android::base::ERROR)) {
+      logd_(id, sev, tag, file, line, message);
+    }
+#endif
+    StderrLogger(id, sev, tag, file, line, message);
+  }
+
+ private:
+#ifdef __ANDROID__
+  ::android::base::LogdLogger logd_;
+#endif
+};
+
 void Usage(char** argv) {
   std::cerr << "Usage: " << argv[0] << " [--output-proto=output.pb] input1.pb [input2.pb ...]" << std::endl;
   std::cerr << "" << std::endl;
@@ -53,7 +84,7 @@ void Usage(char** argv) {
 
 int Main(int argc, char** argv) {
   android::base::InitLogging(argv);
-  android::base::SetLogger(android::base::StderrLogger);
+  android::base::SetLogger(StderrAndLogdErrorLogger{});
 
   bool wait_for_keystroke = false;
   bool enable_verbose = false;
