@@ -335,7 +335,7 @@ struct AppLaunchEventState {
         if (event.timestamp_nanos >= 0) {
            total_time_ns_ = event.timestamp_nanos;
         }
-        RecordDbLaunchHistory();
+        RecordDbLaunchHistory(event.activity_record_proto->proc_id());
         // Finish tracing and collect trace buffer.
         //
         // TODO: this happens automatically when perfetto finishes its
@@ -621,8 +621,8 @@ struct AppLaunchEventState {
     // FIXME: how do we clear this vector?
   }
 
-  void RecordDbLaunchHistory() {
-    std::optional<db::AppLaunchHistoryModel> history = InsertDbLaunchHistory();
+  void RecordDbLaunchHistory(int32_t pid) {
+    std::optional<db::AppLaunchHistoryModel> history = InsertDbLaunchHistory(pid);
 
     // RecordDbLaunchHistory happens-after kIntentStarted
     if (!history_id_subscriber_.has_value()) {
@@ -647,7 +647,7 @@ struct AppLaunchEventState {
     history_id_subscriber_ = std::nullopt;
   }
 
-  std::optional<db::AppLaunchHistoryModel> InsertDbLaunchHistory() {
+  std::optional<db::AppLaunchHistoryModel> InsertDbLaunchHistory(int32_t pid) {
     // TODO: deferred queue into a different lower priority thread.
     if (!component_name_ || !temperature_) {
       LOG(VERBOSE) << "Skip RecordDbLaunchHistory, no component name available.";
@@ -689,7 +689,8 @@ struct AppLaunchEventState {
                                       intent_started_ns_,
                                       total_time_ns_,
                                       // ReportFullyDrawn event normally occurs after this. Need update later.
-                                      /* report_fully_drawn_ns= */ std::nullopt);
+                                      /* report_fully_drawn_ns= */ std::nullopt,
+                                      pid);
     //Repo
     if (!alh) {
       LOG(WARNING) << "Failed to insert app_launch_histories row";

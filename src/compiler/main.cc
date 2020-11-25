@@ -75,6 +75,7 @@ void Usage(char** argv) {
   std::cerr << "    --inode-textcache $,-it $  Resolve inode->filename from textcache (disables diskscan)." << std::endl;
   std::cerr << "    --verbose,-v               Set verbosity (default off)." << std::endl;
   std::cerr << "    --wait,-w                  Wait for key stroke before continuing (default off)." << std::endl;
+  std::cerr << "    --pid,-p                   Set the pid for the compiled trace" << std::endl;
   std::cerr << "    --timestamp_limit_ns,-tl   Set the limit timestamp in nanoseconds for the compiled trace. "
                                               "The order and size of the timestamp should match that of "
                                               "the input trace files. If not specified at all, All of"
@@ -95,6 +96,7 @@ int Main(int argc, char** argv) {
   std::optional<std::string> arg_inode_textcache;
 
   std::vector<uint64_t> timestamp_limit_ns;
+  std::vector<int32_t> pids;
 
   if (argc == 1) {
     // Need at least 1 input file to do anything.
@@ -138,6 +140,18 @@ int Main(int argc, char** argv) {
       enable_verbose = true;
     } else if (argstr == "--wait" || argstr == "-w") {
       wait_for_keystroke = true;
+    } else if (argstr == "--pid" || argstr == "-p") {
+      if (!has_arg_next) {
+        std::cerr << "Missing --pid <value>" << std::endl;
+        return 1;
+      }
+      int32_t pid;
+      if (!::android::base::ParseInt<int32_t>(arg_next, &pid)) {
+        std::cerr << "Invalid --pid "<< pid << std::endl;
+        return 1;
+      }
+      pids.push_back(pid);
+      ++arg;
     } else if (argstr == "--timestamp_limit_ns" || argstr == "-tl") {
       if (!has_arg_next) {
         std::cerr << "Missing --timestamp_limit_ns <value>" << std::endl;
@@ -162,6 +176,11 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
+  if (!pids.empty() && pids.size() != arg_input_filenames.size()) {
+    std::cerr << "The size of pids doesn't match the size of input files."
+              << std::endl;
+    return 1;
+  }
   if (enable_verbose) {
     android::base::SetMinimumLogSeverity(android::base::VERBOSE);
 
@@ -213,7 +232,7 @@ int Main(int argc, char** argv) {
 
   int return_code = 0;
   std::vector<CompilationInput> perfetto_traces =
-      MakeCompilationInputs(arg_input_filenames, timestamp_limit_ns);
+      MakeCompilationInputs(arg_input_filenames, timestamp_limit_ns, pids);
   return_code =
       !PerformCompilation(std::move(perfetto_traces),
                           std::move(arg_output_proto),

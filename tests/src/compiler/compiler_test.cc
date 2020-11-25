@@ -59,7 +59,7 @@ TEST_F(CompilerTest, SingleTraceDuration) {
 
 
   std::vector<CompilationInput> perfetto_traces =
-      MakeCompilationInputs(input_file_names, timestamp_limit_ns);
+      MakeCompilationInputs(input_file_names, timestamp_limit_ns, /*pids=*/{});
   bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
@@ -89,7 +89,7 @@ TEST_F(CompilerTest, MultiTraceDuration) {
   bool output_proto = false;
 
   std::vector<CompilationInput> perfetto_traces =
-      MakeCompilationInputs(input_file_names, timestamp_limit_ns);
+      MakeCompilationInputs(input_file_names, timestamp_limit_ns, /*pids=*/{});
   bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
@@ -118,7 +118,7 @@ TEST_F(CompilerTest, NoTraceDuration) {
   bool output_proto = false;
 
   std::vector<CompilationInput> perfetto_traces =
-      MakeCompilationInputs(input_file_names, /* timestamp_limit_ns= */{});
+      MakeCompilationInputs(input_file_names, /* timestamp_limit_ns= */{}, /*pids=*/{});
   bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
@@ -145,7 +145,7 @@ TEST_F(CompilerTest, BlacklistFilterArtFiles) {
   //                    --blacklist-filter "[.](art|oat|odex|vdex|dex)$" common_perfetto_trace.pb
 
   std::vector<CompilationInput> perfetto_traces =
-      MakeCompilationInputs(input_file_names, /* timestamp_limit_ns= */{});
+      MakeCompilationInputs(input_file_names, /* timestamp_limit_ns= */{}, /*pids=*/{});
   bool result = PerformCompilation(perfetto_traces,
                                    output_file_name,
                                    output_proto,
@@ -158,5 +158,27 @@ TEST_F(CompilerTest, BlacklistFilterArtFiles) {
 
   EXPECT_EQ(result, true);
   EXPECT_EQ(line_num, 1617UL);
+}
+
+TEST_F(CompilerTest, PidFilter) {
+  std::vector<std::string> input_file_names{GetTestDataPath("common_perfetto_trace.pb")};
+  TemporaryFile tmp_file;
+  char* output_file_name = tmp_file.path;
+  bool output_proto = false;
+
+  std::vector<CompilationInput> perfetto_traces =
+      MakeCompilationInputs(input_file_names, /*timestamp_limit_ns=*/{}, /*pids=*/{30716});
+  bool result = PerformCompilation(perfetto_traces,
+                                   output_file_name,
+                                   output_proto,
+                                   /*deny_filter*/std::nullopt,
+                                   ir_dependencies);
+  std::ifstream ifs(output_file_name);
+  size_t line_num = std::count((std::istreambuf_iterator<char>(ifs)),
+                               (std::istreambuf_iterator<char>()),
+                               '\n');
+
+  EXPECT_EQ(result, true);
+  EXPECT_EQ(line_num, 13UL);
 }
 }  // namespace iorap::compiler
