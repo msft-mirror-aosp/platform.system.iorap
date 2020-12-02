@@ -936,15 +936,30 @@ bool PerformCompilation(std::vector<CompilationInput> perfetto_traces,
       }
       int kPageSize = 4096;  // TODO: don't hardcode the page size.
 
-      // Add TraceFileEntry.
-      DCHECK(trace_file_proto->mutable_list() != nullptr);
-      serialize::proto::TraceFileEntry* entry = trace_file_proto->mutable_list()->add_entries();
-      DCHECK(entry != nullptr);
+      int entry_size = trace_file_proto->list().entries_size();
+      bool merged = false;
+      if (entry_size > 0) {
+        serialize::proto::TraceFileEntry* entry =
+            trace_file_proto->mutable_list()->mutable_entries(entry_size-1);
+        if (entry->index_id() == file_handle &&
+            entry->file_offset() + entry->file_length() ==
+            static_cast<int64_t>(event.index) * kPageSize) {
+          entry->set_file_length(entry->file_length() + kPageSize);
+          merged = true;
+        }
+      }
 
-      entry->set_index_id(file_handle);
-      // Page index -> file offset in bytes.
-      entry->set_file_offset(static_cast<int64_t>(event.index) * kPageSize);
-      entry->set_file_length(kPageSize);
+      if (!merged) {
+        // Add TraceFileEntry.
+        DCHECK(trace_file_proto->mutable_list() != nullptr);
+        serialize::proto::TraceFileEntry* entry = trace_file_proto->mutable_list()->add_entries();
+        DCHECK(entry != nullptr);
+
+        entry->set_index_id(file_handle);
+        // Page index -> file offset in bytes.
+        entry->set_file_offset(static_cast<int64_t>(event.index) * kPageSize);
+        entry->set_file_length(kPageSize);
+      }
     })
     .subscribe([&](CompilerPageCacheEvent event) {
       if (!output_proto) {
