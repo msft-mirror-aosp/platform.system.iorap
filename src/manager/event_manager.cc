@@ -239,21 +239,6 @@ struct AppLaunchEventState {
         } else {
           LOG(WARNING) << "Negative event timestamp: " << event.timestamp_nanos;
         }
-
-        // Optimistically start tracing if we have the activity in the intent.
-        if (!event.intent_proto->has_component()) {
-          // Can't do anything if there is no component in the proto.
-          LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent: no component, can't trace";
-          break;
-        }
-
-        if (allowed_readahead_) {
-          StartReadAhead(sequence_id_, component_name);
-        }
-        if (allowed_tracing_ && !IsReadAhead()) {
-          rx_lifetime_ = StartTracing(std::move(component_name));
-        }
-
         break;
       }
       case Type::kIntentFailed:
@@ -262,9 +247,6 @@ struct AppLaunchEventState {
                        << " ignored due to blacklisting.";
           break;
         }
-
-        AbortTrace();
-        AbortReadAhead();
 
         if (history_id_subscriber_) {
           history_id_subscriber_->on_error(rxcpp::util::make_error_ptr(
@@ -300,10 +282,7 @@ struct AppLaunchEventState {
         AppLaunchEvent::Temperature temperature = event.temperature;
         temperature_ = temperature;
         if (temperature != AppLaunchEvent::Temperature::kCold) {
-          LOG(DEBUG) << "AppLaunchEventState#OnNewEvent aborting trace due to non-cold temperature";
-
-          AbortTrace();
-          AbortReadAhead();
+          LOG(DEBUG) << "AppLaunchEventState#OnNewEvent don't trace due to non-cold temperature";
         } else if (!IsTracing() && !IsReadAhead()) {  // and the temperature is Cold.
           // Start late trace when intent didn't have a component name
           LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent need to start new trace";
@@ -477,6 +456,26 @@ struct AppLaunchEventState {
     DCHECK(allowed_tracing_);
     DCHECK(!IsTracing());
 
+    std::optional<int> version =
+        version_map_->GetOrQueryPackageVersion(component_name_->package);
+    if (!version) {
+      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
+      return std::nullopt;
+    }
+    db::VersionedComponentName versioned_component_name{component_name.package,
+                                                        component_name.activity_name,
+                                                        *version};
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+    {
+      ScopedFormatTrace atrace_traces_number_check(
+          ATRACE_TAG_ACTIVITY_MANAGER, "IorapNativeService::CheckPerfettoTracesNnumber");
+      // Just return if we have enough perfetto traces.
+      if (!db::PerfettoTraceFileModel::NeedMorePerfettoTraces(
+          db, versioned_component_name)) {
+        return std::nullopt;
+      }
+    }
+
     auto /*observable<PerfettoStreamCommand>*/ perfetto_commands =
       rxcpp::observable<>::just(PerfettoStreamCommand::kStartTracing)
           // wait 1x
@@ -511,16 +510,7 @@ struct AppLaunchEventState {
              LOG(VERBOSE) << "StartTracing -- PerfettoTraceProto received (2)";
            });
 
-    std::optional<int> version =
-        version_map_->GetOrQueryPackageVersion(component_name_->package);
-    if (!version) {
-      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
-      return std::nullopt;
-    }
-    db::VersionedComponentName versioned_component_name{component_name.package,
-                                                        component_name.activity_name,
-                                                        *version};
-    lifetime = RxAsync::SubscribeAsync(*async_pool_,
+   lifetime = RxAsync::SubscribeAsync(*async_pool_,
         std::move(stream_via_threads),
         /*on_next*/[versioned_component_name]
         (std::tuple<PerfettoTraceProto, int> trace_tuple) {
@@ -558,13 +548,6 @@ struct AppLaunchEventState {
               LOG(ERROR) << "Failed to insert raw_traces for " << file_path;
             } else {
               LOG(VERBOSE) << "Inserted into db: " << *raw_trace;
-
-              ScopedFormatTrace atrace_delete_older_files(
-                  ATRACE_TAG_ACTIVITY_MANAGER,
-                  "Delete older trace files for package");
-
-              // Ensure we don't have too many files per-app.
-              db::PerfettoTraceFileModel::DeleteOlderFiles(db, versioned_component_name);
             }
           }
         },
