@@ -19,6 +19,7 @@
 #include "common/expected.h"
 #include "common/printer.h"
 #include "common/rx_async.h"
+#include "common/property.h"
 #include "common/trace.h"
 #include "db/app_component_name.h"
 #include "db/file_models.h"
@@ -1077,28 +1078,32 @@ class EventManager::Impl {
   }
 
   // Runs the maintenance code to compile perfetto traces to compiled
-  // trace.
+  // trace for a package.
   void StartMaintenance(bool output_text,
                         std::optional<std::string> inode_textcache,
                         bool verbose,
                         bool recompile,
-                        uint64_t min_traces) {
+                        uint64_t min_traces,
+                        std::string package_name,
+                        bool should_update_versions) {
     ScopedFormatTrace atrace_bg_scope(ATRACE_TAG_PACKAGE_MANAGER,
                                       "Background Job Scope");
 
-    {
-      ScopedFormatTrace atrace_update_versions(ATRACE_TAG_PACKAGE_MANAGER,
-                                               "Update package versions map cache");
-      // Update the version map.
-      version_map_->UpdateAll();
-    }
-
     db::DbHandle db{db::SchemaModel::GetSingleton()};
-    {
-      ScopedFormatTrace atrace_cleanup_db(ATRACE_TAG_PACKAGE_MANAGER,
-                                          "Clean up obsolete data in database");
-      // Cleanup the obsolete data in the database.
-      maintenance::CleanUpDatabase(db, version_map_);
+    if (should_update_versions) {
+      {
+        ScopedFormatTrace atrace_update_versions(ATRACE_TAG_PACKAGE_MANAGER,
+                                                 "Update package versions map cache");
+        // Update the version map.
+        version_map_->UpdateAll();
+      }
+
+      {
+        ScopedFormatTrace atrace_cleanup_db(ATRACE_TAG_PACKAGE_MANAGER,
+                                            "Clean up obsolete data in database");
+        // Cleanup the obsolete data in the database.
+        maintenance::CleanUpDatabase(db, version_map_);
+      }
     }
 
     {
@@ -1114,7 +1119,7 @@ class EventManager::Impl {
         std::make_shared<maintenance::Exec>()};
 
       LOG(DEBUG) << "StartMaintenance: min_traces=" << min_traces;
-      maintenance::CompileAppsOnDevice(db, params);
+      maintenance::CompileSingleAppOnDevice(db, params, package_name);
     }
   }
 
@@ -1136,11 +1141,14 @@ class EventManager::Impl {
         LOG(VERBOSE) << "EventManager#JobScheduledEvent#tap(1) - job begins";
         this->NotifyProgress(e.first, TaskResult{TaskResult::State::kBegan});
 
+        LOG(VERBOSE) << "Compile " << std::get<1>(e).package_name;
         StartMaintenance(/*output_text=*/false,
                          /*inode_textcache=*/std::nullopt,
                          /*verbose=*/false,
                          /*recompile=*/false,
-                         s_min_traces);
+                         s_min_traces,
+                         std::get<1>(e).package_name,
+                         std::get<1>(e).should_update_versions);
 
         // TODO: probably this shouldn't be emitted until most of the usual DCHECKs
         // (for example, validate a job isn't already started, the request is not reused, etc).
@@ -1212,18 +1220,11 @@ class EventManager::Impl {
   void RefreshSystemProperties(::android::Printer& printer) {
     // TODO: read all properties from one config class.
     // PH properties do not work if they contain ".". "_" was instead used here.
-    const char* ph_namespace = "runtime_native_boot";
-    tracing_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
-        ph_namespace,
-        "iorap_perfetto_enable",
-        ::android::base::GetProperty("iorapd.perfetto.enable", /*default*/"true")) == "true";
+    tracing_allowed_ = common::IsTracingEnabled(/*default_value=*/"false");
     s_tracing_allowed = tracing_allowed_;
     printer.printFormatLine("iorapd.perfetto.enable = %s", tracing_allowed_ ? "true" : "false");
 
-    readahead_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
-        ph_namespace,
-        "iorap_readahead_enable",
-        ::android::base::GetProperty("iorapd.readahead.enable", /*default*/"true")) == "true";
+    readahead_allowed_ = common::IsReadAheadEnabled(/*default_value=*/"false");
     s_readahead_allowed = readahead_allowed_;
     printer.printFormatLine("iorapd.readahead.enable = %s", s_readahead_allowed ? "true" : "false");
 
@@ -1239,7 +1240,7 @@ class EventManager::Impl {
          * Blacklisted packages are ignored by iorapd.
          */
         server_configurable_flags::GetServerConfigurableFlag(
-            ph_namespace,
+            common::ph_namespace,
             "iorap_blacklisted_packages",
             ::android::base::GetProperty("iorapd.blacklist_packages",
                                          /*default*/""))
