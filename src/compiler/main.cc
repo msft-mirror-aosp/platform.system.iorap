@@ -147,7 +147,7 @@ int Main(int argc, char** argv) {
       }
       int32_t pid;
       if (!::android::base::ParseInt<int32_t>(arg_next, &pid)) {
-        std::cerr << "Invalid --pid "<< pid << std::endl;
+        std::cerr << "Invalid --pid "<< arg_next << std::endl;
         return 1;
       }
       pids.push_back(pid);
