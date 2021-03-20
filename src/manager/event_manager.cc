@@ -63,6 +63,8 @@ using perfetto::PerfettoTraceProto;
 
 using db::AppComponentName;
 
+const constexpr bool kExcludeDexFilesDefault = true;
+
 static std::atomic<bool> s_tracing_allowed{false};
 static std::atomic<bool> s_readahead_allowed{false};
 static std::atomic<uint64_t> s_min_traces{3};
@@ -999,7 +1001,11 @@ class EventManager::Impl {
                  << event.package_name
                  << ")";
 
-    return PurgePackage(event.package_name);
+    if (common::ExcludeDexFiles(kExcludeDexFilesDefault)) {
+      return PurgePackage(event.package_name);
+    }
+
+    return true;
   }
 
   bool OnJobScheduledEvent(RequestId request_id,
@@ -1116,7 +1122,8 @@ class EventManager::Impl {
         verbose,
         recompile,
         min_traces,
-        std::make_shared<maintenance::Exec>()};
+        std::make_shared<maintenance::Exec>(),
+        common::ExcludeDexFiles(kExcludeDexFilesDefault)};
 
       LOG(DEBUG) << "StartMaintenance: min_traces=" << min_traces;
       maintenance::CompileSingleAppOnDevice(db, params, package_name);
@@ -1233,6 +1240,9 @@ class EventManager::Impl {
     uint64_t min_traces = s_min_traces;
     printer.printFormatLine("iorapd.maintenance.min_traces = %" PRIu64, min_traces);
 
+    printer.printFormatLine("iorapd.exclude_dex_files = %s",
+                            common::ExcludeDexFiles(kExcludeDexFilesDefault) ? "true" : "false");
+
     package_blacklister_ = PackageBlacklister{
         /* Colon-separated string list of blacklisted packages, e.g.
          * "foo.bar.baz;com.fake.name" would blacklist {"foo.bar.baz", "com.fake.name"} packages.
@@ -1273,7 +1283,8 @@ class EventManager::Impl {
       WOULD_LOG(VERBOSE),
       /*recompile*/false,
       s_min_traces,
-      std::make_shared<maintenance::Exec>()};
+      std::make_shared<maintenance::Exec>(),
+      common::ExcludeDexFiles(kExcludeDexFilesDefault)};
 
     db::DbHandle db{db::SchemaModel::GetSingleton()};
     bool res = maintenance::CompileSingleAppOnDevice(db, std::move(params), package_name);
