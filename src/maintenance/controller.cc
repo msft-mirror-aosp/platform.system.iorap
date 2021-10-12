@@ -90,6 +90,7 @@ struct CompilerForkParameters {
   std::vector<std::string> input_pbs;
   std::vector<uint64_t> timestamp_limit_ns;
   std::string output_proto;
+  std::vector<int32_t> pids;
   ControllerParameters controller_params;
 
   CompilerForkParameters(const std::vector<compiler::CompilationInput>& perfetto_traces,
@@ -99,6 +100,7 @@ struct CompilerForkParameters {
         for (compiler::CompilationInput perfetto_trace : perfetto_traces) {
           input_pbs.push_back(perfetto_trace.filename);
           timestamp_limit_ns.push_back(perfetto_trace.timestamp_limit_ns);
+          pids.push_back(perfetto_trace.pid);
         }
   }
 };
@@ -109,6 +111,7 @@ std::vector<std::string> MakeCompilerParams(const CompilerForkParameters& params
 
     common::AppendArgsRepeatedly(argv, params.input_pbs);
     common::AppendArgsRepeatedly(argv, "--timestamp_limit_ns", params.timestamp_limit_ns);
+    common::AppendArgsRepeatedly(argv, "--pid", params.pids);
 
     if (controller_params.output_text) {
       argv.push_back("--output-text");
@@ -232,6 +235,11 @@ std::vector<compiler::CompilationInput> GetPerfettoTraceInfo(
       continue;
     }
 
+    if (!history.pid) {
+      LOG(DEBUG) << "Missing pid for history " << history.id;
+      continue;
+    }
+
     uint64_t timestamp_limit = std::numeric_limits<uint64_t>::max();
     // Get corresponding timestamp limit.
     if (history.report_fully_drawn_ns) {
@@ -241,7 +249,7 @@ std::vector<compiler::CompilationInput> GetPerfettoTraceInfo(
     } else {
       LOG(DEBUG) << " No timestamp exists. Using the max value.";
     }
-    perfetto_traces.push_back({raw_trace->file_path, timestamp_limit});
+    perfetto_traces.push_back({raw_trace->file_path, timestamp_limit, history.pid});
   }
   return perfetto_traces;
 }
