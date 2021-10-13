@@ -110,10 +110,6 @@ cc_defaults {
     // TODO: can we use the lite library somehow?
 
     header_libs: ["librxcpp"],
-
-    export_shared_lib_headers: [
-        "packagemanager_aidl-cpp",
-    ],
 }
 
 cc_library_static {
@@ -141,10 +137,6 @@ cc_library_static {
 
     static_libs: [
        "libplatformprotos",  // android framework C++ protos.
-    ],
-
-    export_shared_lib_headers: [
-        "packagemanager_aidl-cpp",
     ],
 }
 
