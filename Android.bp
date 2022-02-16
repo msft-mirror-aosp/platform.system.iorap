@@ -99,8 +99,6 @@ cc_defaults {
         // errors if we use lite
         "libprotobuf-cpp-full",
 
-        "packagemanager_aidl-cpp",
-
         // phenotype flags support
         "server_configurable_flags",
     ],
@@ -127,7 +125,6 @@ cc_library_static {
         "libbinder",
         "libutils",
         "libcutils", // tracing.
-        "packagemanager_aidl-cpp",
     ],
     aidl: {
         local_include_dirs: ["binder"],
