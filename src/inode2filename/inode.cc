@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <sys/sysmacros.h>
+#include <sys/types.h>
 
 using android::base::ParseUint;
 
