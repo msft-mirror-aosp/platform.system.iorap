@@ -34,7 +34,7 @@
 
 namespace iorap::db {
 
-const constexpr int kDbVersion = 3;
+const constexpr int kDbVersion = 2;
 
 struct SqliteDbDeleter {
   void operator()(sqlite3* db) {
@@ -509,8 +509,6 @@ class SchemaModel : public Model {
             total_time_ns INTEGER CHECK(total_time_ns IS NULL or total_time_ns >= 0),
             -- absolute timestamp since epoch
             report_fully_drawn_ns INTEGER CHECK(report_fully_drawn_ns IS NULL or report_fully_drawn_ns >= 0),
-            -- pid of the app
-            pid INTEGER CHECK(pid IS NULL or pid >= 0),
 
             FOREIGN KEY (activity_id) REFERENCES activities (id) ON DELETE CASCADE
         );
@@ -812,8 +810,7 @@ class AppLaunchHistoryModel : public Model {
                                     p.readahead_enabled,
                                     p.intent_started_ns,
                                     p.total_time_ns,
-                                    p.report_fully_drawn_ns,
-                                    p.pid)) {
+                                    p.report_fully_drawn_ns)) {
       return std::nullopt;
     }
 
@@ -846,8 +843,7 @@ class AppLaunchHistoryModel : public Model {
                                       p.readahead_enabled,
                                       p.intent_started_ns,
                                       p.total_time_ns,
-                                      p.report_fully_drawn_ns,
-                                      p.pid)) {
+                                      p.report_fully_drawn_ns)) {
       result.push_back(p);
     }
     return result;
@@ -860,13 +856,12 @@ class AppLaunchHistoryModel : public Model {
                                                      bool readahead_enabled,
                                                      std::optional<uint64_t> intent_started_ns,
                                                      std::optional<uint64_t> total_time_ns,
-                                                     std::optional<uint64_t> report_fully_drawn_ns,
-                                                     int32_t pid)
+                                                     std::optional<uint64_t> report_fully_drawn_ns)
   {
     const char* sql = "INSERT INTO app_launch_histories (activity_id, temperature, trace_enabled, "
                                                         "readahead_enabled, intent_started_ns, "
-                                                        "total_time_ns, report_fully_drawn_ns, pid) "
-                      "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);";
+                                                        "total_time_ns, report_fully_drawn_ns) "
+                      "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);";
 
     std::optional<int> inserted_row_id =
         DbQueryBuilder::Insert(db,
@@ -877,8 +872,7 @@ class AppLaunchHistoryModel : public Model {
                                readahead_enabled,
                                intent_started_ns,
                                total_time_ns,
-                               report_fully_drawn_ns,
-                               pid);
+                               report_fully_drawn_ns);
     if (!inserted_row_id) {
       return std::nullopt;
     }
@@ -892,7 +886,6 @@ class AppLaunchHistoryModel : public Model {
     p.intent_started_ns = intent_started_ns;
     p.total_time_ns = total_time_ns;
     p.report_fully_drawn_ns = report_fully_drawn_ns;
-    p.pid = pid;
 
     return p;
   }
@@ -922,7 +915,6 @@ class AppLaunchHistoryModel : public Model {
   std::optional<uint64_t> intent_started_ns;
   std::optional<uint64_t> total_time_ns;
   std::optional<uint64_t> report_fully_drawn_ns;
-  int32_t pid;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const AppLaunchHistoryModel& p) {
@@ -951,8 +943,6 @@ inline std::ostream& operator<<(std::ostream& os, const AppLaunchHistoryModel& p
   } else {
     os << "(nullopt)";
   }
-  os << ",";
-  os << "pid=" << p.pid;
   os << "}";
   return os;
 }

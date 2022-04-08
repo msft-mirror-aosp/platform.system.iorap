@@ -32,8 +32,6 @@ struct JobScheduledEvent : public AutoParcelable<JobScheduledEvent> {
 
   Type type;
   int32_t job_id;
-  std::string package_name;
-  bool should_update_versions;
 
   enum class Sort : int32_t {
     kIdleMaintenance = 0,
@@ -44,9 +42,7 @@ struct JobScheduledEvent : public AutoParcelable<JobScheduledEvent> {
   constexpr bool operator==(const JobScheduledEvent& other) const {
     return type == other.type
         && job_id == other.job_id
-        && sort == other.sort
-        && package_name == other.package_name
-        && should_update_versions == other.should_update_versions;
+        && sort == other.sort;
   }
 
   constexpr bool operator!=(const JobScheduledEvent& other) const {
@@ -54,8 +50,7 @@ struct JobScheduledEvent : public AutoParcelable<JobScheduledEvent> {
   }
 };
 
-IORAP_INTROSPECT_ADAPT_STRUCT(
-    JobScheduledEvent, type, job_id, sort, package_name, should_update_versions);
+IORAP_INTROSPECT_ADAPT_STRUCT(JobScheduledEvent, type, job_id, sort);
 
 }
 }

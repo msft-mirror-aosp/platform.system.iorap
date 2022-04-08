@@ -291,9 +291,8 @@ class IIorapImpl::Impl {
     package_manager_ = PackageManagerRemote::Create();
 
     if (package_manager_ == nullptr) {
-      LOG(ERROR) << "Failed to get package manager service in IIorapImpl::Impl."
-                 << " Is system_server down?";
-      exit(1);
+      LOG(FATAL) << "Failed to get package manager service in IIorapImpl::Impl";
+      return;
     }
 
     package_change_observer_ =

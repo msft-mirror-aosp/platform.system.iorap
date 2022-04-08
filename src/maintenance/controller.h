@@ -54,22 +54,19 @@ struct ControllerParameters {
   bool recompile;
   uint64_t min_traces;
   std::shared_ptr<IExec> exec;
-  bool exclude_dex_files;
 
   ControllerParameters(bool output_text,
                        std::optional<std::string> inode_textcache,
                        bool verbose,
                        bool recompile,
                        uint64_t min_traces,
-                       std::shared_ptr<IExec> exec,
-                       bool exclude_dex_files) :
+                       std::shared_ptr<IExec> exec) :
     output_text(output_text),
     inode_textcache(inode_textcache),
     verbose(verbose),
     recompile(recompile),
     min_traces(min_traces),
-    exec(exec),
-    exclude_dex_files(exclude_dex_files) {
+    exec(exec) {
   }
 };
 

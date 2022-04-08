@@ -19,7 +19,6 @@
 #include "common/expected.h"
 #include "common/printer.h"
 #include "common/rx_async.h"
-#include "common/property.h"
 #include "common/trace.h"
 #include "db/app_component_name.h"
 #include "db/file_models.h"
@@ -62,8 +61,6 @@ using perfetto::PerfettoStreamCommand;
 using perfetto::PerfettoTraceProto;
 
 using db::AppComponentName;
-
-const constexpr bool kExcludeDexFilesDefault = true;
 
 static std::atomic<bool> s_tracing_allowed{false};
 static std::atomic<bool> s_readahead_allowed{false};
@@ -242,6 +239,21 @@ struct AppLaunchEventState {
         } else {
           LOG(WARNING) << "Negative event timestamp: " << event.timestamp_nanos;
         }
+
+        // Optimistically start tracing if we have the activity in the intent.
+        if (!event.intent_proto->has_component()) {
+          // Can't do anything if there is no component in the proto.
+          LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent: no component, can't trace";
+          break;
+        }
+
+        if (allowed_readahead_) {
+          StartReadAhead(sequence_id_, component_name);
+        }
+        if (allowed_tracing_ && !IsReadAhead()) {
+          rx_lifetime_ = StartTracing(std::move(component_name));
+        }
+
         break;
       }
       case Type::kIntentFailed:
@@ -251,6 +263,9 @@ struct AppLaunchEventState {
           break;
         }
 
+        AbortTrace();
+        AbortReadAhead();
+
         if (history_id_subscriber_) {
           history_id_subscriber_->on_error(rxcpp::util::make_error_ptr(
             std::ios_base::failure("Aborting due to intent failed")));
@@ -259,9 +274,7 @@ struct AppLaunchEventState {
 
         break;
       case Type::kActivityLaunched: {
-        // TODO add test in Android framework to verify this.
-        const std::string& title =
-            event.activity_record_proto->window_token().window_container().identifier().title();
+        const std::string& title = event.activity_record_proto->identifier().title();
         if (!AppComponentName::HasAppComponentName(title)) {
           // Proto comment claim this is sometimes a window title.
           // We need the actual 'package/component' here, so just ignore it if it's a title.
@@ -285,7 +298,10 @@ struct AppLaunchEventState {
         AppLaunchEvent::Temperature temperature = event.temperature;
         temperature_ = temperature;
         if (temperature != AppLaunchEvent::Temperature::kCold) {
-          LOG(DEBUG) << "AppLaunchEventState#OnNewEvent don't trace due to non-cold temperature";
+          LOG(DEBUG) << "AppLaunchEventState#OnNewEvent aborting trace due to non-cold temperature";
+
+          AbortTrace();
+          AbortReadAhead();
         } else if (!IsTracing() && !IsReadAhead()) {  // and the temperature is Cold.
           // Start late trace when intent didn't have a component name
           LOG(VERBOSE) << "AppLaunchEventState#OnNewEvent need to start new trace";
@@ -317,7 +333,7 @@ struct AppLaunchEventState {
         if (event.timestamp_nanos >= 0) {
            total_time_ns_ = event.timestamp_nanos;
         }
-        RecordDbLaunchHistory(event.activity_record_proto->proc_id());
+        RecordDbLaunchHistory();
         // Finish tracing and collect trace buffer.
         //
         // TODO: this happens automatically when perfetto finishes its
@@ -459,26 +475,6 @@ struct AppLaunchEventState {
     DCHECK(allowed_tracing_);
     DCHECK(!IsTracing());
 
-    std::optional<int> version =
-        version_map_->GetOrQueryPackageVersion(component_name_->package);
-    if (!version) {
-      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
-      return std::nullopt;
-    }
-    db::VersionedComponentName versioned_component_name{component_name.package,
-                                                        component_name.activity_name,
-                                                        *version};
-    db::DbHandle db{db::SchemaModel::GetSingleton()};
-    {
-      ScopedFormatTrace atrace_traces_number_check(
-          ATRACE_TAG_ACTIVITY_MANAGER, "IorapNativeService::CheckPerfettoTracesNnumber");
-      // Just return if we have enough perfetto traces.
-      if (!db::PerfettoTraceFileModel::NeedMorePerfettoTraces(
-          db, versioned_component_name)) {
-        return std::nullopt;
-      }
-    }
-
     auto /*observable<PerfettoStreamCommand>*/ perfetto_commands =
       rxcpp::observable<>::just(PerfettoStreamCommand::kStartTracing)
           // wait 1x
@@ -513,7 +509,16 @@ struct AppLaunchEventState {
              LOG(VERBOSE) << "StartTracing -- PerfettoTraceProto received (2)";
            });
 
-   lifetime = RxAsync::SubscribeAsync(*async_pool_,
+    std::optional<int> version =
+        version_map_->GetOrQueryPackageVersion(component_name_->package);
+    if (!version) {
+      LOG(DEBUG) << "The version is NULL, maybe package manager is down.";
+      return std::nullopt;
+    }
+    db::VersionedComponentName versioned_component_name{component_name.package,
+                                                        component_name.activity_name,
+                                                        *version};
+    lifetime = RxAsync::SubscribeAsync(*async_pool_,
         std::move(stream_via_threads),
         /*on_next*/[versioned_component_name]
         (std::tuple<PerfettoTraceProto, int> trace_tuple) {
@@ -551,6 +556,13 @@ struct AppLaunchEventState {
               LOG(ERROR) << "Failed to insert raw_traces for " << file_path;
             } else {
               LOG(VERBOSE) << "Inserted into db: " << *raw_trace;
+
+              ScopedFormatTrace atrace_delete_older_files(
+                  ATRACE_TAG_ACTIVITY_MANAGER,
+                  "Delete older trace files for package");
+
+              // Ensure we don't have too many files per-app.
+              db::PerfettoTraceFileModel::DeleteOlderFiles(db, versioned_component_name);
             }
           }
         },
@@ -607,8 +619,8 @@ struct AppLaunchEventState {
     // FIXME: how do we clear this vector?
   }
 
-  void RecordDbLaunchHistory(int32_t pid) {
-    std::optional<db::AppLaunchHistoryModel> history = InsertDbLaunchHistory(pid);
+  void RecordDbLaunchHistory() {
+    std::optional<db::AppLaunchHistoryModel> history = InsertDbLaunchHistory();
 
     // RecordDbLaunchHistory happens-after kIntentStarted
     if (!history_id_subscriber_.has_value()) {
@@ -633,7 +645,7 @@ struct AppLaunchEventState {
     history_id_subscriber_ = std::nullopt;
   }
 
-  std::optional<db::AppLaunchHistoryModel> InsertDbLaunchHistory(int32_t pid) {
+  std::optional<db::AppLaunchHistoryModel> InsertDbLaunchHistory() {
     // TODO: deferred queue into a different lower priority thread.
     if (!component_name_ || !temperature_) {
       LOG(VERBOSE) << "Skip RecordDbLaunchHistory, no component name available.";
@@ -675,8 +687,7 @@ struct AppLaunchEventState {
                                       intent_started_ns_,
                                       total_time_ns_,
                                       // ReportFullyDrawn event normally occurs after this. Need update later.
-                                      /* report_fully_drawn_ns= */ std::nullopt,
-                                      pid);
+                                      /* report_fully_drawn_ns= */ std::nullopt);
     //Repo
     if (!alh) {
       LOG(WARNING) << "Failed to insert app_launch_histories row";
@@ -730,7 +741,7 @@ struct AppLaunchEventDefender {
       case Type::kActivityLaunchCancelled:
       case Type::kReportFullyDrawn: {  // From a terminal state, only go to kIntentStarted
         if (event.type != Type::kIntentStarted) {
-          LOG(DEBUG) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
           last_event_type_ = Type::kUninitialized;
           return Result::kReject;
         } else {
@@ -746,7 +757,7 @@ struct AppLaunchEventDefender {
           last_event_type_ = event.type;
           return Result::kAccept;
         } else {
-          LOG(DEBUG) << "Overwriting transition from kIntentStarted to "
+          LOG(WARNING) << "Overwriting transition from kIntentStarted to "
                        << event.type << " into kIntentFailed";
           last_event_type_ = Type::kIntentFailed;
 
@@ -762,7 +773,7 @@ struct AppLaunchEventDefender {
           last_event_type_ = event.type;
           return Result::kAccept;
         } else {
-          LOG(DEBUG) << "Overwriting transition from kActivityLaunched to "
+          LOG(WARNING) << "Overwriting transition from kActivityLaunched to "
                        << event.type << " into kActivityLaunchCancelled";
           last_event_type_ = Type::kActivityLaunchCancelled;
 
@@ -778,7 +789,7 @@ struct AppLaunchEventDefender {
           last_event_type_ = event.type;
           return Result::kAccept;
         } else {
-          LOG(DEBUG) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
+          LOG(WARNING) << "Rejecting transition from " << last_event_type_ << " to " << event.type;
           last_event_type_ = Type::kUninitialized;
           return Result::kReject;
         }
@@ -1001,10 +1012,6 @@ class EventManager::Impl {
                  << event.package_name
                  << ")";
 
-    if (common::ExcludeDexFiles(kExcludeDexFilesDefault)) {
-      LOG(VERBOSE) << "Dex files are excluded. Skip the purging.";
-      return true;
-    }
     return PurgePackage(event.package_name);
   }
 
@@ -1084,32 +1091,28 @@ class EventManager::Impl {
   }
 
   // Runs the maintenance code to compile perfetto traces to compiled
-  // trace for a package.
+  // trace.
   void StartMaintenance(bool output_text,
                         std::optional<std::string> inode_textcache,
                         bool verbose,
                         bool recompile,
-                        uint64_t min_traces,
-                        std::string package_name,
-                        bool should_update_versions) {
+                        uint64_t min_traces) {
     ScopedFormatTrace atrace_bg_scope(ATRACE_TAG_PACKAGE_MANAGER,
                                       "Background Job Scope");
 
-    db::DbHandle db{db::SchemaModel::GetSingleton()};
-    if (should_update_versions) {
-      {
-        ScopedFormatTrace atrace_update_versions(ATRACE_TAG_PACKAGE_MANAGER,
-                                                 "Update package versions map cache");
-        // Update the version map.
-        version_map_->UpdateAll();
-      }
+    {
+      ScopedFormatTrace atrace_update_versions(ATRACE_TAG_PACKAGE_MANAGER,
+                                               "Update package versions map cache");
+      // Update the version map.
+      version_map_->UpdateAll();
+    }
 
-      {
-        ScopedFormatTrace atrace_cleanup_db(ATRACE_TAG_PACKAGE_MANAGER,
-                                            "Clean up obsolete data in database");
-        // Cleanup the obsolete data in the database.
-        maintenance::CleanUpDatabase(db, version_map_);
-      }
+    db::DbHandle db{db::SchemaModel::GetSingleton()};
+    {
+      ScopedFormatTrace atrace_cleanup_db(ATRACE_TAG_PACKAGE_MANAGER,
+                                          "Clean up obsolete data in database");
+      // Cleanup the obsolete data in the database.
+      maintenance::CleanUpDatabase(db, version_map_);
     }
 
     {
@@ -1122,11 +1125,10 @@ class EventManager::Impl {
         verbose,
         recompile,
         min_traces,
-        std::make_shared<maintenance::Exec>(),
-        common::ExcludeDexFiles(kExcludeDexFilesDefault)};
+        std::make_shared<maintenance::Exec>()};
 
       LOG(DEBUG) << "StartMaintenance: min_traces=" << min_traces;
-      maintenance::CompileSingleAppOnDevice(db, params, package_name);
+      maintenance::CompileAppsOnDevice(db, params);
     }
   }
 
@@ -1148,14 +1150,11 @@ class EventManager::Impl {
         LOG(VERBOSE) << "EventManager#JobScheduledEvent#tap(1) - job begins";
         this->NotifyProgress(e.first, TaskResult{TaskResult::State::kBegan});
 
-        LOG(VERBOSE) << "Compile " << std::get<1>(e).package_name;
         StartMaintenance(/*output_text=*/false,
                          /*inode_textcache=*/std::nullopt,
                          /*verbose=*/false,
                          /*recompile=*/false,
-                         s_min_traces,
-                         std::get<1>(e).package_name,
-                         std::get<1>(e).should_update_versions);
+                         s_min_traces);
 
         // TODO: probably this shouldn't be emitted until most of the usual DCHECKs
         // (for example, validate a job isn't already started, the request is not reused, etc).
@@ -1227,11 +1226,18 @@ class EventManager::Impl {
   void RefreshSystemProperties(::android::Printer& printer) {
     // TODO: read all properties from one config class.
     // PH properties do not work if they contain ".". "_" was instead used here.
-    tracing_allowed_ = common::IsTracingEnabled(/*default_value=*/"false");
+    const char* ph_namespace = "runtime_native_boot";
+    tracing_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
+        ph_namespace,
+        "iorap_perfetto_enable",
+        ::android::base::GetProperty("iorapd.perfetto.enable", /*default*/"true")) == "true";
     s_tracing_allowed = tracing_allowed_;
     printer.printFormatLine("iorapd.perfetto.enable = %s", tracing_allowed_ ? "true" : "false");
 
-    readahead_allowed_ = common::IsReadAheadEnabled(/*default_value=*/"false");
+    readahead_allowed_ = server_configurable_flags::GetServerConfigurableFlag(
+        ph_namespace,
+        "iorap_readahead_enable",
+        ::android::base::GetProperty("iorapd.readahead.enable", /*default*/"true")) == "true";
     s_readahead_allowed = readahead_allowed_;
     printer.printFormatLine("iorapd.readahead.enable = %s", s_readahead_allowed ? "true" : "false");
 
@@ -1240,9 +1246,6 @@ class EventManager::Impl {
     uint64_t min_traces = s_min_traces;
     printer.printFormatLine("iorapd.maintenance.min_traces = %" PRIu64, min_traces);
 
-    printer.printFormatLine("iorapd.exclude_dex_files = %s",
-                            common::ExcludeDexFiles(kExcludeDexFilesDefault) ? "true" : "false");
-
     package_blacklister_ = PackageBlacklister{
         /* Colon-separated string list of blacklisted packages, e.g.
          * "foo.bar.baz;com.fake.name" would blacklist {"foo.bar.baz", "com.fake.name"} packages.
@@ -1250,7 +1253,7 @@ class EventManager::Impl {
          * Blacklisted packages are ignored by iorapd.
          */
         server_configurable_flags::GetServerConfigurableFlag(
-            common::ph_namespace,
+            ph_namespace,
             "iorap_blacklisted_packages",
             ::android::base::GetProperty("iorapd.blacklist_packages",
                                          /*default*/""))
@@ -1283,8 +1286,7 @@ class EventManager::Impl {
       WOULD_LOG(VERBOSE),
       /*recompile*/false,
       s_min_traces,
-      std::make_shared<maintenance::Exec>(),
-      common::ExcludeDexFiles(kExcludeDexFilesDefault)};
+      std::make_shared<maintenance::Exec>()};
 
     db::DbHandle db{db::SchemaModel::GetSingleton()};
     bool res = maintenance::CompileSingleAppOnDevice(db, std::move(params), package_name);
